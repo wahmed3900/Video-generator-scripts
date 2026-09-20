@@ -45,6 +45,7 @@ from typing import Optional
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -60,6 +61,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI(title="AI Video Generator")
+
+# Comma-separated list of allowed frontend origins, e.g.:
+#   ALLOWED_ORIGINS=https://video-generator-scripts-frontend.vercel.app,http://localhost:3000
+# Falls back to this project's actual known frontend + local dev origins if unset.
+_default_origins = "https://video-generator-scripts-frontend.vercel.app,http://localhost:3000,http://127.0.0.1:5500"
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 JOBS_DIR = Path("jobs")
 JOBS_DIR.mkdir(exist_ok=True)
