@@ -1,7 +1,9 @@
+
 fastapi
 uvicorn
 anthropic
 requests
 python-dotenv
 mutagen
-google-generativeai
+google-generativeai 
+Pillow
