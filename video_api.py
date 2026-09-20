@@ -1,22 +1,29 @@
 """
-main.py
+video_api.py
 
 FastAPI wrapper around the full video-generator pipeline:
   1. generate_video_script.py  -> script
   2. fetch_stock_footage.py    -> script + stock clips
-  3. generate_voiceover.py     -> script + voiceover audio
-  4. assemble_video.py         -> final .mp4
+  3. generate_marketing.py     -> platform marketing copy
+  4. generate_voiceover.py     -> voiceover audio
+  5. assemble_video.py         -> final .mp4
 
 Exposes:
-  POST /generate-video   -> kicks off generation, returns a job_id
-  GET  /jobs/{job_id}    -> check status / get the final video URL
+  POST /generate-video          -> kicks off generation, returns a job_id
+  GET  /jobs/{job_id}           -> check status
+  GET  /jobs/{job_id}/video     -> download the final .mp4
+  GET  /jobs/{job_id}/marketing -> platform copy for the finished video
+  GET  /videos?email=           -> history for one email
+  GET  /subscription-status     -> free-tier usage / subscription state
+  POST /create-checkout-session -> Stripe Checkout for Pro
+  POST /stripe-webhook          -> Stripe subscription webhook
 
 Usage:
-    uvicorn main:app --reload
+    uvicorn video_api:app --reload
 
 Requires:
-    pip install fastapi uvicorn python-dotenv pymongo
-    (plus everything the four pipeline scripts already require)
+    pip install fastapi uvicorn python-dotenv pymongo stripe
+    (plus everything the pipeline scripts require)
 
 NOTE ON ASYNC PROCESSING:
 Video generation takes real time (LLM call + footage search + TTS +
@@ -34,11 +41,16 @@ running that job, so an interrupted job needs to be re-submitted; this
 change just makes that visible instead of silently losing the record.
 If MONGODB_URI isn't set, falls back to the original in-memory dict so
 local development without Mongo still works.
+
+NOTE ON RESTART RECOVERY:
+On startup, any job still in a non-terminal state (pending / generating_*
+/ assembling_video) is marked "failed" with an interruption message,
+because the process that was running it was killed by the restart. Without
+this, orphaned jobs sit at "assembling_video" forever.
 """
 
 import os
 import uuid
-import shutil
 from pathlib import Path
 from enum import Enum
 from typing import Optional
@@ -62,10 +74,19 @@ load_dotenv()
 
 app = FastAPI(title="AI Video Generator")
 
-# Comma-separated list of allowed frontend origins, e.g.:
-#   ALLOWED_ORIGINS=https://video-generator-scripts-frontend.vercel.app,http://localhost:3000
-# Falls back to this project's actual known frontend + local dev origins if unset.
-_default_origins = "https://video-generator-scripts-frontend.vercel.app,http://localhost:3000,http://127.0.0.1:5500"
+# ------------------------------------------------------------
+# CORS
+# ------------------------------------------------------------
+# Comma-separated list of allowed frontend origins. Includes both the
+# plain Vercel URL and the -0786 hashed URL Vercel actually assigned,
+# since plain names are frequently taken on Vercel's free tier.
+# Override with ALLOWED_ORIGINS env var in Render if your URLs change.
+_default_origins = (
+    "https://video-generator-scripts-frontend.vercel.app,"
+    "https://video-generator-scripts-frontend-0786.vercel.app,"
+    "http://localhost:3000,"
+    "http://127.0.0.1:5500"
+)
 ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()
 ]
@@ -90,6 +111,18 @@ class JobStatus(str, Enum):
     ASSEMBLING_VIDEO = "assembling_video"
     DONE = "done"
     FAILED = "failed"
+
+
+# Statuses that mean "still in progress" — used for the startup recovery
+# sweep that marks orphaned jobs as failed.
+NON_TERMINAL_STATUSES = [
+    JobStatus.PENDING.value,
+    JobStatus.GENERATING_SCRIPT.value,
+    JobStatus.FETCHING_FOOTAGE.value,
+    JobStatus.GENERATING_MARKETING.value,
+    JobStatus.GENERATING_VOICEOVER.value,
+    JobStatus.ASSEMBLING_VIDEO.value,
+]
 
 
 class GenerateVideoRequest(BaseModel):
@@ -142,15 +175,29 @@ _mongo_client = None
 _jobs_collection = None
 _subscriptions_collection = None
 _usage_collection = None
+
 if MONGODB_URI:
     try:
-        print(f"MONGODB_URI debug: {MONGODB_URI[:40]!r} len={len(MONGODB_URI)}")
         _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         _mongo_client.admin.command("ping")
         _jobs_collection = _mongo_client["video_generator"]["jobs"]
         _subscriptions_collection = _mongo_client["video_generator"]["subscriptions"]
         _usage_collection = _mongo_client["video_generator"]["usage"]
         print("MongoDB connected — job status will survive redeploys.")
+
+        # Startup recovery: any job still in a non-terminal state was killed
+        # by the restart that brought this process up. Mark them failed so
+        # they don't sit at "assembling_video" forever.
+        sweep = _jobs_collection.update_many(
+            {"status": {"$in": NON_TERMINAL_STATUSES}},
+            {"$set": {
+                "status": JobStatus.FAILED.value,
+                "error": "Job interrupted by server restart — please re-submit.",
+            }},
+        )
+        if sweep.modified_count:
+            print(f"Marked {sweep.modified_count} orphaned job(s) as failed on startup.")
+
     except Exception as e:
         print(f"MongoDB connection failed: {e} — falling back to in-memory job storage.")
         _mongo_client = None
@@ -204,7 +251,7 @@ def get_job(job_id: str) -> Optional[dict]:
 
 
 # ============================================================
-# STRIPE — subscription billing ($35/mo unlimited after the free tier)
+# STRIPE — subscription billing ($40/mo unlimited after the free tier)
 # ============================================================
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
@@ -213,6 +260,15 @@ if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 else:
     print("STRIPE_SECRET_KEY missing — /create-checkout-session will fail")
+
+# stripe-python moved StripeError to the top level in v7; older versions
+# use stripe.error.StripeError. Support both so this file doesn't break
+# on a version bump.
+StripeError = getattr(stripe, "StripeError", None) or stripe.error.StripeError
+SignatureVerificationError = (
+    getattr(stripe, "SignatureVerificationError", None)
+    or stripe.error.SignatureVerificationError
+)
 
 # ============================================================
 # FREE TIER — limited videos/month before the paywall kicks in.
@@ -273,20 +329,18 @@ def check_and_record_usage(email: str) -> None:
 
 def run_pipeline(job_id: str, topic: str, duration_seconds: int, tone: str) -> None:
     """
-    Runs all five pipeline steps in sequence for one job, updating the
-    job's status in storage as it progresses so the client can poll.
+    Runs all pipeline steps in sequence for one job, updating the job's
+    status in storage as it progresses so the client can poll.
     """
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     original_cwd = Path.cwd()
 
     try:
-        import os as _os
-        _os.chdir(job_dir)  # keep each job's intermediate files isolated
+        os.chdir(job_dir)  # keep each job's intermediate files isolated
 
-        anthropic_key = os.environ["ANTHROPIC_API_KEY"]
-        pexels_key = os.environ["PEXELS_API_KEY"]
-        elevenlabs_key = os.environ["ELEVENLABS_API_KEY"]
+        pexels_key = os.environ.get("PEXELS_API_KEY")
+        elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY")
         gemini_key = os.environ.get("GEMINI_API_KEY")  # optional — marketing step degrades gracefully without it
 
         update_job(job_id, status=JobStatus.GENERATING_SCRIPT.value)
@@ -317,7 +371,7 @@ def run_pipeline(job_id: str, topic: str, duration_seconds: int, tone: str) -> N
         update_job(job_id, status=JobStatus.FAILED.value, error=str(e))
 
     finally:
-        _os.chdir(original_cwd)
+        os.chdir(original_cwd)
 
 
 @app.post("/generate-video", response_model=JobResponse)
@@ -415,13 +469,20 @@ def root():
     return {"message": "AI Video Generator API is running. POST to /generate-video to start."}
 
 
+@app.head("/")
+def health_check():
+    """Render's health check pings HEAD /. Without this route, uvicorn
+    returns 405 Method Not Allowed, which is harmless but noisy in logs."""
+    return {}
+
+
 # ============================================================
 # STRIPE ENDPOINTS
 # ============================================================
 
 @app.post("/create-checkout-session", response_model=CheckoutResult)
 def create_checkout_session(req: CheckoutRequest):
-    """Creates a Stripe Checkout session for the $35/mo unlimited subscription."""
+    """Creates a Stripe Checkout session for the $40/mo unlimited subscription."""
     if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
         raise HTTPException(status_code=500, detail="Stripe is not configured on the server.")
     if not req.email.strip():
@@ -436,7 +497,7 @@ def create_checkout_session(req: CheckoutRequest):
             cancel_url=req.cancel_url,
             client_reference_id=req.email.lower(),
         )
-    except stripe.error.StripeError as e:
+    except StripeError as e:
         raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
 
     return CheckoutResult(checkout_url=session.url)
@@ -457,7 +518,7 @@ async def stripe_webhook(request: Request):
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError as e:
+    except SignatureVerificationError as e:
         raise HTTPException(status_code=400, detail=f"Invalid signature: {e}")
 
     if _subscriptions_collection is None:
