@@ -147,7 +147,14 @@ def generate_script(topic: str, duration_seconds: int = 30, tone: str = "punchy 
             max_tokens=MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw_text = response.content[0].text.strip()
+        first_block = response.content[0]
+        block_text = getattr(first_block, "text", None)
+        if block_text is None:
+            raise RuntimeError(
+                f"Unexpected Claude response block type: {type(first_block).__name__} "
+                "(expected a text block)"
+            )
+        raw_text = block_text.strip()
     except Exception as e:
         anthropic_error = e
         print(f"Anthropic call failed ({e}); falling back to Gemini...")
@@ -181,9 +188,31 @@ def generate_script(topic: str, duration_seconds: int = 30, tone: str = "punchy 
         raw_text = raw_text.strip()
 
     try:
-        return json.loads(raw_text)
+        data = json.loads(raw_text)
     except json.JSONDecodeError as e:
         raise ValueError(f"Model did not return valid JSON. Raw response:\n{raw_text}") from e
+
+    # Fold the CTA scene into the main scenes list so it flows through the
+    # rest of the pipeline (stock footage, voiceover, video assembly)
+    # exactly like any other scene — those steps only know how to iterate
+    # script["scenes"], so a separate top-level cta_scene field would
+    # otherwise be silently dropped before it ever reaches the final video.
+    cta = data.pop("cta_scene", None)
+    if cta:
+        cta = dict(cta)
+        cta["order"] = len(data.get("scenes", [])) + 1
+        cta.setdefault("retention_risk", "n/a")
+        cta.setdefault("retention_note", f"CTA scene ({cta.get('cta_type', 'cta')})")
+        data.setdefault("scenes", []).append(cta)
+
+    # Recompute total duration from the actual scene durations rather than
+    # trusting the model's arithmetic — it can drift, especially now that
+    # the CTA scene is folded in after the fact.
+    data["total_duration_seconds"] = sum(
+        s.get("duration_seconds", 0) for s in data.get("scenes", [])
+    )
+
+    return data
 
 
 if __name__ == "__main__":
