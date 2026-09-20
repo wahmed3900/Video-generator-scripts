@@ -4,3 +4,4 @@ anthropic
 requests
 python-dotenv
 mutagen
+google-generativeai
