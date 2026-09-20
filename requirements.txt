@@ -5,7 +5,6 @@ anthropic
 requests
 python-dotenv
 mutagen
- 
 Pillow
 pymongo
 google-genai
