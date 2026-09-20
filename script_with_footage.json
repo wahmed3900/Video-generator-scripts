@@ -1,0 +1,76 @@
+{
+  "hook_strength_notes": "This hook uses a bold claim about losing money to instantly trigger curiosity and high emotional stakes audio-first.",
+  "scenes": [
+    {
+      "order": 1,
+      "narration": "Your free stock app is secretly built to make you lose.",
+      "visual_description": "A hand holding a smartphone showing a red stock chart dropping rapidly",
+      "duration_seconds": 3,
+      "stock_clip": {
+        "pexels_id": 35886692,
+        "duration": 30,
+        "preview_url": "https://www.pexels.com/video/hands-trading-on-mobile-app-at-night-35886692/",
+        "download_url": "https://videos.pexels.com/video-files/35886692/15220656_960_540_25fps.mp4",
+        "width": 960,
+        "height": 540
+      }
+    },
+    {
+      "order": 2,
+      "narration": "Basic charts are free, but real-time data is locked behind a paywall.",
+      "visual_description": "Screen recording of tapping a locked feature on a stock app with a pop-up price tag",
+      "duration_seconds": 4,
+      "stock_clip": {
+        "pexels_id": 34953965,
+        "duration": 17,
+        "preview_url": "https://www.pexels.com/video/analyzing-cryptocurrency-charts-on-smartphone-34953965/",
+        "download_url": "https://videos.pexels.com/video-files/34953965/14806521_960_540_50fps.mp4",
+        "width": 960,
+        "height": 540
+      }
+    },
+    {
+      "order": 3,
+      "narration": "That\u2019s because live exchange feeds cost millions, so they push the price onto you.",
+      "visual_description": "Extreme closeup of a finger hitting a glowing red Subscribe button on phone screen",
+      "duration_seconds": 4,
+      "stock_clip": {
+        "pexels_id": 3978049,
+        "duration": 8,
+        "preview_url": "https://www.pexels.com/video/subscribe-button-on-green-screen-3978049/",
+        "download_url": "https://videos.pexels.com/video-files/3978049/3978049-sd_960_540_30fps.mp4",
+        "width": 960,
+        "height": 540
+      }
+    },
+    {
+      "order": 4,
+      "narration": "Meaning you're making trades using fifteen-minute-delayed prices.",
+      "visual_description": "A digital clock ticking backwards rapidly next to a flickering stock ticker",
+      "duration_seconds": 3,
+      "stock_clip": {
+        "pexels_id": 29527767,
+        "duration": 10,
+        "preview_url": "https://www.pexels.com/video/retro-style-digital-countdown-timer-29527767/",
+        "download_url": "https://videos.pexels.com/video-files/29527767/12710578_960_540_30fps.mp4",
+        "width": 960,
+        "height": 540
+      }
+    },
+    {
+      "order": 5,
+      "narration": "Ditch the paid upgrade and use free browser screeners instead.",
+      "visual_description": "A laptop screen opening a free desktop stock screener dashboard with green charts",
+      "duration_seconds": 4,
+      "stock_clip": {
+        "pexels_id": 37962427,
+        "duration": 32,
+        "preview_url": "https://www.pexels.com/video/dynamic-trading-terminal-in-dark-room-environment-37962427/",
+        "download_url": "https://videos.pexels.com/video-files/37962427/16108303_960_540_25fps.mp4",
+        "width": 960,
+        "height": 540
+      }
+    }
+  ],
+  "total_duration_seconds": 18
+}

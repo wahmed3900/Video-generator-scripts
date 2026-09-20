@@ -1,0 +1,36 @@
+{
+  "hook_strength_notes": "This hook uses a bold claim about losing money to instantly trigger curiosity and high emotional stakes audio-first.",
+  "scenes": [
+    {
+      "order": 1,
+      "narration": "Your free stock app is secretly built to make you lose.",
+      "visual_description": "A hand holding a smartphone showing a red stock chart dropping rapidly",
+      "duration_seconds": 3
+    },
+    {
+      "order": 2,
+      "narration": "Basic charts are free, but real-time data is locked behind a paywall.",
+      "visual_description": "Screen recording of tapping a locked feature on a stock app with a pop-up price tag",
+      "duration_seconds": 4
+    },
+    {
+      "order": 3,
+      "narration": "That\u2019s because live exchange feeds cost millions, so they push the price onto you.",
+      "visual_description": "Extreme closeup of a finger hitting a glowing red Subscribe button on phone screen",
+      "duration_seconds": 4
+    },
+    {
+      "order": 4,
+      "narration": "Meaning you're making trades using fifteen-minute-delayed prices.",
+      "visual_description": "A digital clock ticking backwards rapidly next to a flickering stock ticker",
+      "duration_seconds": 3
+    },
+    {
+      "order": 5,
+      "narration": "Ditch the paid upgrade and use free browser screeners instead.",
+      "visual_description": "A laptop screen opening a free desktop stock screener dashboard with green charts",
+      "duration_seconds": 4
+    }
+  ],
+  "total_duration_seconds": 18
+}
