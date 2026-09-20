@@ -34,7 +34,7 @@ except ImportError:
 # CONFIG
 # ---------------------------------------------------------------------------
 
-MODEL = "claude-sonnet-4-6"  # Fast + strong writing quality for this use case
+MODEL = "claude-opus-4-1"  # Fast + strong writing quality for this use case
 MAX_TOKENS = 1500
 GEMINI_MODEL = "gemini-3.6-flash"  # used only if ANTHROPIC_API_KEY is missing/invalid
 
