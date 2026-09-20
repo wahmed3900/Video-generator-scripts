@@ -42,11 +42,13 @@ import shutil
 from pathlib import Path
 from enum import Enum
 from typing import Optional
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pymongo import MongoClient
+import stripe
 
 from generate_video_script import generate_script
 from fetch_stock_footage import attach_footage_to_script
@@ -78,12 +80,31 @@ class GenerateVideoRequest(BaseModel):
     topic: str
     duration_seconds: int = 30
     tone: str = "punchy and direct"
+    email: str  # required — used for the free-tier usage limit and subscription check
 
 
 class JobResponse(BaseModel):
     job_id: str
     status: JobStatus
     error: str | None = None
+
+
+class CheckoutRequest(BaseModel):
+    email: str
+    success_url: str
+    cancel_url: str
+
+
+class CheckoutResult(BaseModel):
+    checkout_url: str
+
+
+class SubscriptionStatus(BaseModel):
+    email: str
+    active: bool
+    videos_used_this_month: int
+    free_videos_per_month: int
+    dev_mode: bool
 
 
 # ============================================================
@@ -93,16 +114,22 @@ class JobResponse(BaseModel):
 MONGODB_URI = os.environ.get("MONGODB_URI")
 _mongo_client = None
 _jobs_collection = None
+_subscriptions_collection = None
+_usage_collection = None
 if MONGODB_URI:
     try:
         _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         _mongo_client.admin.command("ping")
         _jobs_collection = _mongo_client["video_generator"]["jobs"]
+        _subscriptions_collection = _mongo_client["video_generator"]["subscriptions"]
+        _usage_collection = _mongo_client["video_generator"]["usage"]
         print("MongoDB connected — job status will survive redeploys.")
     except Exception as e:
         print(f"MongoDB connection failed: {e} — falling back to in-memory job storage.")
         _mongo_client = None
         _jobs_collection = None
+        _subscriptions_collection = None
+        _usage_collection = None
 
 # Only used if MongoDB isn't configured/reachable.
 _JOBS_FALLBACK: dict[str, dict] = {}
@@ -128,6 +155,74 @@ def get_job(job_id: str) -> Optional[dict]:
     if _jobs_collection is not None:
         return _jobs_collection.find_one({"_id": job_id})
     return _JOBS_FALLBACK.get(job_id)
+
+
+# ============================================================
+# STRIPE — subscription billing ($35/mo unlimited after the free tier)
+# ============================================================
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+else:
+    print("STRIPE_SECRET_KEY missing — /create-checkout-session will fail")
+
+# ============================================================
+# FREE TIER — limited videos/month before the paywall kicks in.
+# Without MongoDB configured, usage can't be tracked reliably, so access
+# is left open (dev mode) rather than blocking people on a broken config.
+# ============================================================
+FREE_VIDEOS_PER_MONTH = int(os.environ.get("FREE_VIDEOS_PER_MONTH", "3"))
+
+
+def _current_month_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def has_active_subscription(email: str) -> bool:
+    if _subscriptions_collection is None:
+        return False  # no DB — treated as free tier, not "unlimited", so usage limits still apply
+    doc = _subscriptions_collection.find_one({"email": email.lower().strip(), "status": "active"})
+    return doc is not None
+
+
+def get_usage_count(email: str) -> int:
+    if _usage_collection is None:
+        return 0
+    doc = _usage_collection.find_one({"email": email.lower().strip(), "month": _current_month_key()})
+    return doc["count"] if doc else 0
+
+
+def increment_usage(email: str) -> None:
+    if _usage_collection is None:
+        return
+    _usage_collection.update_one(
+        {"email": email.lower().strip(), "month": _current_month_key()},
+        {"$inc": {"count": 1}},
+        upsert=True,
+    )
+
+
+def check_and_record_usage(email: str) -> None:
+    """Raises HTTPException(402) if the free limit is hit and there's no active subscription.
+    Otherwise records this video against the caller's monthly usage count."""
+    if has_active_subscription(email):
+        return  # unlimited — no usage tracking needed
+
+    if _usage_collection is None:
+        return  # no DB configured — dev mode, don't block anyone
+
+    used = get_usage_count(email)
+    if used >= FREE_VIDEOS_PER_MONTH:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"Free tier limit reached ({FREE_VIDEOS_PER_MONTH} videos/month). "
+                "Use /create-checkout-session to subscribe for unlimited videos."
+            ),
+        )
+    increment_usage(email)
 
 
 def run_pipeline(job_id: str, topic: str, duration_seconds: int, tone: str) -> None:
@@ -184,7 +279,14 @@ def generate_video(request: GenerateVideoRequest, background_tasks: BackgroundTa
     """
     Kicks off video generation for the given topic. Returns immediately
     with a job_id — poll GET /jobs/{job_id} to check progress.
+
+    Gated behind the free-tier monthly limit (or an active subscription).
     """
+    if not request.email.strip():
+        raise HTTPException(status_code=400, detail="email is required")
+
+    check_and_record_usage(request.email)  # raises 402 if the free limit is hit
+
     job_id = str(uuid.uuid4())
     create_job(job_id)
 
@@ -241,3 +343,90 @@ def get_job_marketing(job_id: str):
 @app.get("/")
 def root():
     return {"message": "AI Video Generator API is running. POST to /generate-video to start."}
+
+
+# ============================================================
+# STRIPE ENDPOINTS
+# ============================================================
+
+@app.post("/create-checkout-session", response_model=CheckoutResult)
+def create_checkout_session(req: CheckoutRequest):
+    """Creates a Stripe Checkout session for the $35/mo unlimited subscription."""
+    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+        raise HTTPException(status_code=500, detail="Stripe is not configured on the server.")
+    if not req.email.strip():
+        raise HTTPException(status_code=400, detail="email is required")
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            customer_email=req.email,
+            success_url=req.success_url,
+            cancel_url=req.cancel_url,
+            client_reference_id=req.email.lower(),
+        )
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
+
+    return CheckoutResult(checkout_url=session.url)
+
+
+# NOTE: this path must exactly match the endpoint URL configured in
+# Stripe Dashboard -> Developers -> Webhooks for THIS service (separate
+# from any other project's webhook — each service needs its own).
+@app.post("/stripe-webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Stripe webhook secret not configured on the server.")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid signature: {e}")
+
+    if _subscriptions_collection is None:
+        # Can't record it, but acknowledge receipt so Stripe doesn't retry forever.
+        return {"received": True, "warning": "No database configured — subscription not recorded."}
+
+    try:
+        if event["type"] == "checkout.session.completed":
+            s = event["data"]["object"]
+            email = (s.get("customer_email") or s.get("client_reference_id") or "").lower()
+            if email:
+                _subscriptions_collection.update_one(
+                    {"email": email},
+                    {"$set": {"status": "active", "customer_id": s.get("customer")}},
+                    upsert=True,
+                )
+        elif event["type"] in ("customer.subscription.deleted", "customer.subscription.paused"):
+            cust = event["data"]["object"].get("customer")
+            if cust:
+                _subscriptions_collection.update_one(
+                    {"customer_id": cust}, {"$set": {"status": "canceled"}}
+                )
+    except Exception as e:
+        print(f"Webhook processing error: {e}")
+
+    return {"received": True}
+
+
+@app.get("/subscription-status", response_model=SubscriptionStatus)
+def subscription_status(email: str):
+    """Lets the frontend show remaining free videos / subscription state
+    before someone tries to generate a video and hits a 402."""
+    if not email.strip():
+        raise HTTPException(status_code=400, detail="email is required")
+
+    return SubscriptionStatus(
+        email=email,
+        active=has_active_subscription(email),
+        videos_used_this_month=get_usage_count(email),
+        free_videos_per_month=FREE_VIDEOS_PER_MONTH,
+        dev_mode=_usage_collection is None,
+    )
