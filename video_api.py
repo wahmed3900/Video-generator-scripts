@@ -107,6 +107,16 @@ class SubscriptionStatus(BaseModel):
     dev_mode: bool
 
 
+class VideoSummary(BaseModel):
+    job_id: str
+    topic: str
+    status: JobStatus
+    created_at: str
+    error: str | None = None
+    has_video: bool
+    has_marketing: bool
+
+
 # ============================================================
 # JOB STORAGE — MongoDB if configured, otherwise an in-memory
 # fallback dict so local dev without Mongo still works.
@@ -135,12 +145,31 @@ if MONGODB_URI:
 _JOBS_FALLBACK: dict[str, dict] = {}
 
 
-def create_job(job_id: str) -> None:
-    doc = {"_id": job_id, "status": JobStatus.PENDING.value, "error": None, "video_path": None}
+def create_job(job_id: str, email: str, topic: str) -> None:
+    doc = {
+        "_id": job_id,
+        "status": JobStatus.PENDING.value,
+        "error": None,
+        "video_path": None,
+        "email": email.lower().strip(),
+        "topic": topic,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
     if _jobs_collection is not None:
         _jobs_collection.insert_one(doc)
     else:
         _JOBS_FALLBACK[job_id] = doc
+
+
+def list_jobs_for_email(email: str, limit: int = 50) -> list:
+    """Returns this email's video-generation history, newest first."""
+    email = email.lower().strip()
+    if _jobs_collection is not None:
+        cursor = _jobs_collection.find({"email": email}).sort("created_at", -1).limit(limit)
+        return list(cursor)
+    matches = [job for job in _JOBS_FALLBACK.values() if job.get("email") == email]
+    matches.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+    return matches[:limit]
 
 
 def update_job(job_id: str, **fields) -> None:
@@ -288,7 +317,7 @@ def generate_video(request: GenerateVideoRequest, background_tasks: BackgroundTa
     check_and_record_usage(request.email)  # raises 402 if the free limit is hit
 
     job_id = str(uuid.uuid4())
-    create_job(job_id)
+    create_job(job_id, request.email, request.topic)
 
     background_tasks.add_task(
         run_pipeline, job_id, request.topic, request.duration_seconds, request.tone
@@ -338,6 +367,30 @@ def get_job_marketing(job_id: str):
         )
 
     return marketing
+
+
+@app.get("/videos", response_model=list[VideoSummary])
+def list_videos(email: str):
+    """Returns this editor's full video-generation history, newest first —
+    the 'multiple videos per editor' dashboard view. Each entry shows
+    enough to decide whether to check its status, download the video, or
+    grab its marketing copy, without fetching every job's full detail."""
+    if not email.strip():
+        raise HTTPException(status_code=400, detail="email is required")
+
+    jobs = list_jobs_for_email(email)
+    return [
+        VideoSummary(
+            job_id=job["_id"],
+            topic=job.get("topic", ""),
+            status=job["status"],
+            created_at=job.get("created_at", ""),
+            error=job.get("error"),
+            has_video=job.get("video_path") is not None,
+            has_marketing=job.get("marketing") is not None,
+        )
+        for job in jobs
+    ]
 
 
 @app.get("/")
