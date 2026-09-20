@@ -10,8 +10,9 @@ Usage:
     python generate_video_script.py
 
 Requires:
-    pip install anthropic
+    pip install anthropic google-genai
     An ANTHROPIC_API_KEY environment variable set with your API key.
+    (Optional, for the Gemini fallback) A GEMINI_API_KEY environment variable.
 """
 
 import os
@@ -25,9 +26,9 @@ except ImportError:
     pass  # dotenv is optional; environment variables can be set another way
 
 try:
-    import google.generativeai as genai
+    from google import genai
 except ImportError:
-    genai = None  # google-generativeai is optional; only needed for the Gemini fallback
+    genai = None  # google-genai is optional; only needed for the Gemini fallback
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -117,12 +118,12 @@ def generate_script(topic: str, duration_seconds: int = 30, tone: str = "punchy 
         anthropic_error = e
         print(f"Anthropic call failed ({e}); falling back to Gemini...")
 
-    # Fall back to Gemini if Anthropic failed and google-generativeai is available
+    # Fall back to Gemini if Anthropic failed and google-genai is available
     if raw_text is None:
         if genai is None:
             raise RuntimeError(
-                "Anthropic call failed and google-generativeai is not installed. "
-                "Run: pip install google-generativeai"
+                "Anthropic call failed and google-genai is not installed. "
+                "Run: pip install google-genai"
             ) from anthropic_error
 
         gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -131,9 +132,11 @@ def generate_script(topic: str, duration_seconds: int = 30, tone: str = "punchy 
                 "Anthropic call failed and GEMINI_API_KEY is not set for fallback."
             ) from anthropic_error
 
-        genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        gemini_response = model.generate_content(prompt)
+        gemini_client = genai.Client(api_key=gemini_key)
+        gemini_response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
         raw_text = gemini_response.text.strip()
 
     # Defensive cleanup in case the model wraps output in markdown fences
