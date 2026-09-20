@@ -144,6 +144,7 @@ _subscriptions_collection = None
 _usage_collection = None
 if MONGODB_URI:
     try:
+        print(f"MONGODB_URI debug: {MONGODB_URI[:40]!r} len={len(MONGODB_URI)}")
         _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         _mongo_client.admin.command("ping")
         _jobs_collection = _mongo_client["video_generator"]["jobs"]
