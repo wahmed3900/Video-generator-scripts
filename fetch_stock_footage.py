@@ -1,4 +1,3 @@
-
 """
 fetch_stock_footage.py
 
@@ -16,9 +15,9 @@ Requires:
     script_output.json in the same directory (produced by step 1)
 """
 
-
 import os
 import json
+import time
 import requests
 
 try:
@@ -30,6 +29,8 @@ except ImportError:
 PEXELS_SEARCH_URL = "https://api.pexels.com/videos/search"
 MIN_DURATION_SECONDS = 3   # skip clips shorter than this
 PREFERRED_ORIENTATION = "landscape"  # or "portrait" for TikTok/Reels-style output
+REQUEST_DELAY_SECONDS = 0.5  # small pause between scenes to avoid bursting Pexels' rate limit
+MAX_RETRIES = 3
 
 
 def search_stock_clip(query: str, api_key: str, min_duration: int = MIN_DURATION_SECONDS) -> dict | None:
@@ -52,9 +53,25 @@ def search_stock_clip(query: str, api_key: str, min_duration: int = MIN_DURATION
         "orientation": PREFERRED_ORIENTATION,
     }
 
-    response = requests.get(PEXELS_SEARCH_URL, headers=headers, params=params, timeout=15)
-    response.raise_for_status()
-    data = response.json()
+    last_exception = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        response = requests.get(PEXELS_SEARCH_URL, headers=headers, params=params, timeout=15)
+
+        if response.status_code == 403 or response.status_code == 429:
+            # Likely a rate limit — back off and retry rather than failing the whole job
+            wait_seconds = 2 * attempt
+            print(f"  Pexels returned {response.status_code} (attempt {attempt}/{MAX_RETRIES}) — "
+                  f"waiting {wait_seconds}s before retrying...")
+            time.sleep(wait_seconds)
+            last_exception = requests.HTTPError(f"{response.status_code} error from Pexels", response=response)
+            continue
+
+        response.raise_for_status()
+        data = response.json()
+        break
+    else:
+        # All retries exhausted
+        raise last_exception
 
     videos = data.get("videos", [])
     if not videos:
@@ -115,6 +132,8 @@ def attach_footage_to_script(script: dict, api_key: str) -> dict:
             print(f"Scene {scene['order']}: found clip for '{query}' ({clip['duration']}s)")
         else:
             print(f"Scene {scene['order']}: NO MATCH for '{query}' — needs fallback")
+
+        time.sleep(REQUEST_DELAY_SECONDS)  # small pause to avoid bursting the rate limit
 
     return script
 
