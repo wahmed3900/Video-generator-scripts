@@ -8,3 +8,4 @@ mutagen
 Pillow
 pymongo
 google-genai
+stripe
