@@ -7,3 +7,4 @@ python-dotenv
 mutagen
 google-generativeai 
 Pillow
+pymongo
