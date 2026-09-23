@@ -1,0 +1,7 @@
+  .git
+   __pycache__
+   .env
+   *.mp4
+   audio/
+   raw_clips/
+   processed_clips/
