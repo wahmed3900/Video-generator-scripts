@@ -22,7 +22,7 @@ Usage:
     uvicorn video_api:app --reload
 
 Requires:
-    pip install fastapi uvicorn python-dotenv pymongo stripe google-cloud-storage
+    pip install fastapi uvicorn python-dotenv pymongo stripe
     (plus everything the pipeline scripts require)
 
 NOTE ON ASYNC PROCESSING:
@@ -30,59 +30,47 @@ Video generation takes real time (LLM call + footage search + TTS +
 FFmpeg render) — too long for a single HTTP request to wait on. This
 version uses FastAPI's BackgroundTasks for a simple job queue, which is
 fine for a single-server deployment. Once you have real traffic, swap
-this for Celery + Redis (or Cloud Run Jobs) so jobs can scale across
-multiple workers.
-
-NOTE ON CONCURRENCY:
-The pipeline scripts write intermediate files relative to the current
-working directory, so each job chdir()s into its own folder. The working
-directory is process-wide, so jobs on the same instance are serialized
-with a lock to stop two jobs from writing into each other's folders.
+this for Celery + Redis so jobs can scale across multiple workers.
 
 NOTE ON JOB STORAGE:
 Job status is stored in MongoDB (if MONGODB_URI is set) rather than an
 in-memory dict, so a server redeploy no longer wipes job records — a job
 interrupted mid-run will correctly show "failed" instead of vanishing
 into "Job not found". A redeploy still kills the actual FFmpeg process
-running that job, so an interrupted job needs to be re-submitted.
-If MONGODB_URI isn't set, falls back to an in-memory dict so local
-development without Mongo still works.
+running that job, so an interrupted job needs to be re-submitted; this
+change just makes that visible instead of silently losing the record.
+If MONGODB_URI isn't set, falls back to the original in-memory dict so
+local development without Mongo still works.
 
 NOTE ON RESTART RECOVERY:
 On startup, any job still in a non-terminal state (pending / generating_*
 / assembling_video) is marked "failed" with an interruption message,
-because the process that was running it was killed by the restart.
-
-NOTE ON VIDEO FILES:
-Finished videos are uploaded to Cloud Storage right after assembly
-completes, so they survive Cloud Run restarting or scaling to zero.
-/jobs/{id}/video fetches the file back from Cloud Storage rather than
-relying on the container's local (temporary) disk.
+because the process that was running it was killed by the restart. Without
+this, orphaned jobs sit at "assembling_video" forever.
 """
 
 import os
-import threading
 import uuid
-from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
+from enum import Enum
 from typing import Optional
+from datetime import datetime, timezone
 
-import stripe
-from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pymongo import MongoClient
+import stripe
 
-from assemble_video import assemble_video
-from fetch_stock_footage import attach_footage_to_script
-from gcs_storage import download_video_to_temp, upload_video
-from generate_marketing import attach_marketing_to_script
 from generate_video_script import generate_script
+from fetch_stock_footage import attach_footage_to_script
 from generate_voiceover import generate_voiceovers_for_script
+from assemble_video import assemble_video
+from generate_marketing import attach_marketing_to_script
+from gcs_storage import upload_video, download_video_to_temp
 
+from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI(title="AI Video Generator")
@@ -90,36 +78,29 @@ app = FastAPI(title="AI Video Generator")
 # ------------------------------------------------------------
 # CORS
 # ------------------------------------------------------------
-# Comma-separated list of allowed frontend origins.
-# Override with the ALLOWED_ORIGINS env var if your URLs change.
-# The regex below also allows any Vercel URL for this frontend project.
+# Comma-separated list of allowed frontend origins. Includes both the
+# plain Vercel URL and the -0786 hashed URL Vercel actually assigned,
+# since plain names are frequently taken on Vercel's free tier.
+# Override with ALLOWED_ORIGINS env var in Render if your URLs change.
 _default_origins = (
-    "https://video-generator-scripts-frontend-07.vercel.app,"
     "https://video-generator-scripts-frontend.vercel.app,"
     "https://video-generator-scripts-frontend-0786.vercel.app,"
     "http://localhost:3000,"
     "http://127.0.0.1:5500"
 )
 ALLOWED_ORIGINS = [
-    o.strip().rstrip("/")
-    for o in os.environ.get("ALLOWED_ORIGINS", _default_origins).split(",")
-    if o.strip()
+    o.strip() for o in os.environ.get("ALLOWED_ORIGINS", _default_origins).split(",") if o.strip()
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://video-generator-scripts-frontend.*\.vercel\.app",
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-JOBS_DIR = Path("jobs").resolve()
+JOBS_DIR = Path("jobs")
 JOBS_DIR.mkdir(exist_ok=True)
-
-# The working directory is shared by the whole process, so only one
-# pipeline may run per instance at a time. See NOTE ON CONCURRENCY.
-_PIPELINE_LOCK = threading.Lock()
 
 
 class JobStatus(str, Enum):
@@ -186,10 +167,6 @@ class VideoSummary(BaseModel):
     has_marketing: bool
 
 
-def normalize_email(email: str) -> str:
-    return (email or "").strip().lower()
-
-
 # ============================================================
 # JOB STORAGE — MongoDB if configured, otherwise an in-memory
 # fallback dict so local dev without Mongo still works.
@@ -204,14 +181,14 @@ if MONGODB_URI:
     try:
         _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         _mongo_client.admin.command("ping")
-        _db = _mongo_client["video_generator"]
-        _jobs_collection = _db["jobs"]
-        _subscriptions_collection = _db["subscriptions"]
-        _usage_collection = _db["usage"]
+        _jobs_collection = _mongo_client["video_generator"]["jobs"]
+        _subscriptions_collection = _mongo_client["video_generator"]["subscriptions"]
+        _usage_collection = _mongo_client["video_generator"]["usage"]
         print("MongoDB connected — job status will survive redeploys.")
 
         # Startup recovery: any job still in a non-terminal state was killed
-        # by the restart that brought this process up.
+        # by the restart that brought this process up. Mark them failed so
+        # they don't sit at "assembling_video" forever.
         sweep = _jobs_collection.update_many(
             {"status": {"$in": NON_TERMINAL_STATUSES}},
             {"$set": {
@@ -228,8 +205,6 @@ if MONGODB_URI:
         _jobs_collection = None
         _subscriptions_collection = None
         _usage_collection = None
-else:
-    print("MONGODB_URI not set — using in-memory job storage (dev mode).")
 
 # Only used if MongoDB isn't configured/reachable.
 _JOBS_FALLBACK: dict[str, dict] = {}
@@ -241,8 +216,7 @@ def create_job(job_id: str, email: str, topic: str) -> None:
         "status": JobStatus.PENDING.value,
         "error": None,
         "video_path": None,
-        "gcs_blob": None,
-        "email": normalize_email(email),
+        "email": email.lower().strip(),
         "topic": topic,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -254,7 +228,7 @@ def create_job(job_id: str, email: str, topic: str) -> None:
 
 def list_jobs_for_email(email: str, limit: int = 50) -> list:
     """Returns this email's video-generation history, newest first."""
-    email = normalize_email(email)
+    email = email.lower().strip()
     if _jobs_collection is not None:
         cursor = _jobs_collection.find({"email": email}).sort("created_at", -1).limit(limit)
         return list(cursor)
@@ -289,7 +263,8 @@ else:
     print("STRIPE_SECRET_KEY missing — /create-checkout-session will fail")
 
 # stripe-python moved StripeError to the top level in v7; older versions
-# use stripe.error.StripeError. Support both.
+# use stripe.error.StripeError. Support both so this file doesn't break
+# on a version bump.
 StripeError = getattr(stripe, "StripeError", None) or stripe.error.StripeError
 SignatureVerificationError = (
     getattr(stripe, "SignatureVerificationError", None)
@@ -298,8 +273,8 @@ SignatureVerificationError = (
 
 # ============================================================
 # FREE TIER — limited videos/month before the paywall kicks in.
-# Without MongoDB, usage can't be tracked reliably, so access is left
-# open (dev mode) rather than blocking people on a broken config.
+# Without MongoDB configured, usage can't be tracked reliably, so access
+# is left open (dev mode) rather than blocking people on a broken config.
 # ============================================================
 FREE_VIDEOS_PER_MONTH = int(os.environ.get("FREE_VIDEOS_PER_MONTH", "3"))
 
@@ -310,15 +285,15 @@ def _current_month_key() -> str:
 
 def has_active_subscription(email: str) -> bool:
     if _subscriptions_collection is None:
-        return False
-    doc = _subscriptions_collection.find_one({"email": normalize_email(email), "status": "active"})
+        return False  # no DB — treated as free tier, not "unlimited", so usage limits still apply
+    doc = _subscriptions_collection.find_one({"email": email.lower().strip(), "status": "active"})
     return doc is not None
 
 
 def get_usage_count(email: str) -> int:
     if _usage_collection is None:
         return 0
-    doc = _usage_collection.find_one({"email": normalize_email(email), "month": _current_month_key()})
+    doc = _usage_collection.find_one({"email": email.lower().strip(), "month": _current_month_key()})
     return doc["count"] if doc else 0
 
 
@@ -326,15 +301,15 @@ def increment_usage(email: str) -> None:
     if _usage_collection is None:
         return
     _usage_collection.update_one(
-        {"email": normalize_email(email), "month": _current_month_key()},
+        {"email": email.lower().strip(), "month": _current_month_key()},
         {"$inc": {"count": 1}},
         upsert=True,
     )
 
 
 def check_and_record_usage(email: str) -> None:
-    """Raises HTTPException(402) if the free limit is hit and there's no active
-    subscription. Otherwise records this video against the monthly usage count."""
+    """Raises HTTPException(402) if the free limit is hit and there's no active subscription.
+    Otherwise records this video against the caller's monthly usage count."""
     if has_active_subscription(email):
         return  # unlimited — no usage tracking needed
 
@@ -347,7 +322,7 @@ def check_and_record_usage(email: str) -> None:
             status_code=402,
             detail=(
                 f"Free tier limit reached ({FREE_VIDEOS_PER_MONTH} videos/month). "
-                "Subscribe for unlimited videos."
+                "Use /create-checkout-session to subscribe for unlimited videos."
             ),
         )
     increment_usage(email)
@@ -360,58 +335,45 @@ def run_pipeline(job_id: str, topic: str, duration_seconds: int, tone: str) -> N
     """
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    original_cwd = Path.cwd()
 
-    with _PIPELINE_LOCK:
-        original_cwd = Path.cwd()
-        try:
-            os.chdir(job_dir)  # keep each job's intermediate files isolated
+    try:
+        os.chdir(job_dir)  # keep each job's intermediate files isolated
 
-            pexels_key = os.environ.get("PEXELS_API_KEY")
-            elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY")
-            gemini_key = os.environ.get("GEMINI_API_KEY")  # optional — marketing degrades gracefully
+        pexels_key = os.environ.get("PEXELS_API_KEY")
+        elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY")
+        gemini_key = os.environ.get("GEMINI_API_KEY")  # optional — marketing step degrades gracefully without it
 
-            update_job(job_id, status=JobStatus.GENERATING_SCRIPT.value)
-            script = generate_script(topic, duration_seconds, tone)
+        update_job(job_id, status=JobStatus.GENERATING_SCRIPT.value)
+        script = generate_script(topic, duration_seconds, tone)
 
-            update_job(job_id, status=JobStatus.FETCHING_FOOTAGE.value)
-            script = attach_footage_to_script(script, pexels_key)
+        update_job(job_id, status=JobStatus.FETCHING_FOOTAGE.value)
+        script = attach_footage_to_script(script, pexels_key)
 
-            update_job(job_id, status=JobStatus.GENERATING_MARKETING.value)
-            script = attach_marketing_to_script(script, gemini_key)
-            # attach_marketing_to_script never raises — on failure it sets
-            # script["marketing"] = None, so the pipeline continues regardless.
-            update_job(job_id, marketing=script.get("marketing"))
+        update_job(job_id, status=JobStatus.GENERATING_MARKETING.value)
+        script = attach_marketing_to_script(script, gemini_key)
+        # attach_marketing_to_script never raises — on failure it just sets
+        # script["marketing"] = None, so the pipeline continues regardless.
+        update_job(job_id, marketing=script.get("marketing"))
 
-            update_job(job_id, status=JobStatus.GENERATING_VOICEOVER.value)
-            script = generate_voiceovers_for_script(script, elevenlabs_key)
+        update_job(job_id, status=JobStatus.GENERATING_VOICEOVER.value)
+        script = generate_voiceovers_for_script(script, elevenlabs_key)
 
-            update_job(job_id, status=JobStatus.ASSEMBLING_VIDEO.value)
-            final_path = assemble_video(script)
+        update_job(job_id, status=JobStatus.ASSEMBLING_VIDEO.value)
+        final_path = assemble_video(script)
 
-            # Upload the finished video to Cloud Storage right away, so it
-            # survives this instance restarting or scaling down. See NOTE
-            # ON VIDEO FILES at the top of this file.
-            blob_name = f"videos/{job_id}.mp4"
-            upload_video(final_path, blob_name)
+        update_job(
+            job_id,
+            status=JobStatus.DONE.value,
+            video_path=str((job_dir / final_path).resolve()),
+        )
 
-            update_job(
-                job_id,
-                status=JobStatus.DONE.value,
-                video_path=str((job_dir / final_path).resolve()),
-                gcs_blob=blob_name,
-            )
+    except Exception as e:
+        update_job(job_id, status=JobStatus.FAILED.value, error=str(e))
 
-        except Exception as e:
-            print(f"Job {job_id} failed: {e}")
-            update_job(job_id, status=JobStatus.FAILED.value, error=str(e))
+    finally:
+        os.chdir(original_cwd)
 
-        finally:
-            os.chdir(original_cwd)
-
-
-# ============================================================
-# ROUTES
-# ============================================================
 
 @app.post("/generate-video", response_model=JobResponse)
 def generate_video(request: GenerateVideoRequest, background_tasks: BackgroundTasks):
@@ -421,22 +383,16 @@ def generate_video(request: GenerateVideoRequest, background_tasks: BackgroundTa
 
     Gated behind the free-tier monthly limit (or an active subscription).
     """
-    email = normalize_email(request.email)
-    topic = request.topic.strip()
-    if not email:
+    if not request.email.strip():
         raise HTTPException(status_code=400, detail="email is required")
-    if not topic:
-        raise HTTPException(status_code=400, detail="topic is required")
-    if not 5 <= request.duration_seconds <= 300:
-        raise HTTPException(status_code=400, detail="duration_seconds must be between 5 and 300")
 
-    check_and_record_usage(email)  # raises 402 if the free limit is hit
+    check_and_record_usage(request.email)  # raises 402 if the free limit is hit
 
     job_id = str(uuid.uuid4())
-    create_job(job_id, email, topic)
+    create_job(job_id, request.email, request.topic)
 
     background_tasks.add_task(
-        run_pipeline, job_id, topic, request.duration_seconds, request.tone
+        run_pipeline, job_id, request.topic, request.duration_seconds, request.tone
     )
 
     return JobResponse(job_id=job_id, status=JobStatus.PENDING)
@@ -454,8 +410,7 @@ def get_job_status(job_id: str):
 
 @app.get("/jobs/{job_id}/video")
 def get_job_video(job_id: str):
-    """Returns the final video file once the job is done, fetched from
-    Cloud Storage so it works even after a server restart."""
+    """Returns the final video file once the job is done."""
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -463,19 +418,15 @@ def get_job_video(job_id: str):
     if job["status"] != JobStatus.DONE.value:
         raise HTTPException(status_code=409, detail=f"Job not finished yet (status: {job['status']})")
 
-    gcs_blob = job.get("gcs_blob")
-    if not gcs_blob:
-        raise HTTPException(status_code=404, detail="Video file not found in storage.")
-
-    temp_path = Path(f"/tmp/{job_id}.mp4")
-    download_video_to_temp(gcs_blob, temp_path)
-    return FileResponse(temp_path, media_type="video/mp4", filename="video.mp4")
+    return FileResponse(job["video_path"], media_type="video/mp4", filename="video.mp4")
 
 
 @app.get("/jobs/{job_id}/marketing")
 def get_job_marketing(job_id: str):
-    """Returns the platform-specific marketing copy generated for this job.
-    Available as soon as the marketing step completes."""
+    """Returns the platform-specific marketing copy (YouTube, TikTok,
+    Instagram, X, email, LinkedIn) generated for this job. Available as
+    soon as the marketing-generation step completes — no need to wait for
+    the full video to finish assembling."""
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -492,8 +443,11 @@ def get_job_marketing(job_id: str):
 
 @app.get("/videos", response_model=list[VideoSummary])
 def list_videos(email: str):
-    """Returns this user's full video-generation history, newest first."""
-    if not normalize_email(email):
+    """Returns this editor's full video-generation history, newest first —
+    the 'multiple videos per editor' dashboard view. Each entry shows
+    enough to decide whether to check its status, download the video, or
+    grab its marketing copy, without fetching every job's full detail."""
+    if not email.strip():
         raise HTTPException(status_code=400, detail="email is required")
 
     jobs = list_jobs_for_email(email)
@@ -504,7 +458,7 @@ def list_videos(email: str):
             status=job["status"],
             created_at=job.get("created_at", ""),
             error=job.get("error"),
-            has_video=job.get("gcs_blob") is not None,
+            has_video=job.get("video_path") is not None,
             has_marketing=job.get("marketing") is not None,
         )
         for job in jobs
@@ -518,8 +472,8 @@ def root():
 
 @app.head("/")
 def health_check():
-    """Health checks may ping HEAD /. Without this route, uvicorn returns
-    405 Method Not Allowed, which is harmless but noisy in logs."""
+    """Render's health check pings HEAD /. Without this route, uvicorn
+    returns 405 Method Not Allowed, which is harmless but noisy in logs."""
     return {}
 
 
@@ -532,18 +486,17 @@ def create_checkout_session(req: CheckoutRequest):
     """Creates a Stripe Checkout session for the $40/mo unlimited subscription."""
     if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
         raise HTTPException(status_code=500, detail="Stripe is not configured on the server.")
-    email = normalize_email(req.email)
-    if not email:
+    if not req.email.strip():
         raise HTTPException(status_code=400, detail="email is required")
 
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
             line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-            customer_email=email,
+            customer_email=req.email,
             success_url=req.success_url,
             cancel_url=req.cancel_url,
-            client_reference_id=email,
+            client_reference_id=req.email.lower(),
         )
     except StripeError as e:
         raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
@@ -552,7 +505,8 @@ def create_checkout_session(req: CheckoutRequest):
 
 
 # NOTE: this path must exactly match the endpoint URL configured in
-# Stripe Dashboard -> Developers -> Webhooks for THIS service.
+# Stripe Dashboard -> Developers -> Webhooks for THIS service (separate
+# from any other project's webhook — each service needs its own).
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
@@ -575,7 +529,7 @@ async def stripe_webhook(request: Request):
     try:
         if event["type"] == "checkout.session.completed":
             s = event["data"]["object"]
-            email = normalize_email(s.get("customer_email") or s.get("client_reference_id") or "")
+            email = (s.get("customer_email") or s.get("client_reference_id") or "").lower()
             if email:
                 _subscriptions_collection.update_one(
                     {"email": email},
@@ -598,7 +552,7 @@ async def stripe_webhook(request: Request):
 def subscription_status(email: str):
     """Lets the frontend show remaining free videos / subscription state
     before someone tries to generate a video and hits a 402."""
-    if not normalize_email(email):
+    if not email.strip():
         raise HTTPException(status_code=400, detail="email is required")
 
     return SubscriptionStatus(

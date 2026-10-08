@@ -9,3 +9,5 @@ Pillow
 pymongo
 google-genai
 stripe
+google-cloud-texttospeech
+google-cloud-storage

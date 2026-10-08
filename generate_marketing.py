@@ -33,7 +33,7 @@ except ImportError:
 
 INPUT_FILE = "script_with_footage.json"
 OUTPUT_FILE = "script_with_marketing.json"
-MODEL_NAME = "gemini-2.5-flash"  # swap for a newer model as they're released
+MODEL_NAME = "gemini-3.6-flash"  # swap for a newer model as they're released
 
 
 PROMPT_TEMPLATE = """You are a senior social media marketer. Below is the script for a short video.
